@@ -1,23 +1,16 @@
 """Main module. This has functions that do the sampling, save the chains, and analyse the results."""
 ## Python packages required:
 import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
 import numpy as np
 import emcee
-import corner
-import random
-import math
-import subprocess
 from astropy.io import ascii
 import astropy.units as u
 import astropy.constants as const
-import pickle
 from matplotlib.ticker import MaxNLocator
-import sys
-from scipy.stats.kde import gaussian_kde
-import scipy.stats as stats
-import matplotlib.mlab as mlab
-import tables
-from scipy.interpolate import interp1d
+from scipy.stats import gaussian_kde
+# import scipy.stats as stats
+from scipy.interpolate import splrep, BSpline, splint
 from chainconsumer import ChainConsumer
 from multiprocessing import Pool
 import os
@@ -27,27 +20,24 @@ from configparser import ConfigParser
 import pkg_resources  # part of setuptools
 try:
     # this will fail if the package is not pip-installed
-    __version__ = pkg_resources.require("beans")[0].version
+    __version__ = pkg_resources.require("beansp")[0].version
 except:
     # in which case just record the path
     __version__ = os.getcwd()
 
-try:
-    # Required for the distance_limit method
-    import concord as cd
-except:
-    pass
+# Some constants
+
+BSTART_ERR = 10*u.min # Default uncertainty for burst start times
 
 # -------------------------------------------------------------------------#
 ## load local  modules
 from .settle import settle
-from .burstrain import generate_burst_train, next_burst, get_a_b, mean_flux, burstensemble
+from .burstrain import generate_burst_train, next_burst, burstensemble
 from .run_model import runmodel
 from .get_data import get_obs
 from .mrprior import mr_prior
 from .run_emcee import runemcee
 from .analyse import get_param_uncert_obs, get_param_uncert
-from .initialise import init
 
 # -------------------------------------------------------------------------#
 
@@ -69,7 +59,6 @@ def lnZprior(z):
     """
 
     from scipy import stats
-    import numpy as np
 
     beta = stats.beta
     ZCNO = 0.01
@@ -88,8 +77,6 @@ def prior_func(theta_in):
     :param theta_in: parameter vector
     """
 
-    import numpy as np
-
     X, Z, Q_b, f_a, f_E, r1, r2, r3, mass, radius = theta_in
 
     # upper bound and lower bounds of each parameter defined here. Bounds were
@@ -106,6 +93,195 @@ def prior_func(theta_in):
         return -np.inf
 
 
+def prior_1808(theta_in):
+    """
+    This function implements a simple box prior for all the parameters 
+    excluding mass, radius, and the metallicity, which come instead from
+    separate functions
+
+    This prior is explicitly intended for use with SAX J1808.4-3653, and
+    should only be used with extreme caution in other cases!
+
+    :param theta_in: parameter vector
+    """
+
+    X, Z, Q_b, f_a, f_E, r1, r2, r3, mass, radius = theta_in
+
+    # upper bound and lower bounds of each parameter defined here. Bounds were
+    # found by considering an estimated value for each parameter then giving
+    # reasonable limits.
+    if (0.00001 < X < 0.76) and (Z > 0.00001) and\
+        (0.000001 <= Q_b < 5.0) and (1 <= f_a < 100) and (1 <= f_E < 100) and \
+        (0.005 < r1 < 1.0) and (0.005 < r2 < 3.0) and \
+        (0 < r3 * 1e3 < 1000) \
+        and (1.15 < mass < 2.5) and (9 < radius < 17):
+
+        return 0.0 + lnZprior(Z) + mr_prior(mass, radius) 
+    else:
+        return -np.inf
+
+
+def calc_dist_anisotropy(r1, r2, r3):
+    '''
+    Calculate distance and inclincation from scaling factors.  These
+    functions are taken (more or less) from Goodwin et al. 2019, eq.  18-20, 
+    but there seem to be some slight differences
+
+    TODO also infer the inclination, which will depend on the model
+    adopted for the anisotropy; because the burst and persistent emission
+    anisotropy are free to vary independently, there is no guarantee there
+    would be an inclination value consistent with every pair of values for
+    a given model
+
+    :param r1: ratio of mdot to bolometric (isotropic) fluence (eq. 12)
+    :param r2: ratio of observed to predicted alpha (eq. 13)
+    :param r3: ratio of fluence to isotropic burst energy (eq. 14)
+
+    :return: distance, xi_b, xi_p
+    '''
+
+    xi_p = np.power( (r1*r2*r3*1e3)/(63.23*0.74816), 0.5)
+    xi_b = (0.74816*xi_p)/r2
+    distance = 10*np.power((r1/xi_p), 0.5) #kpc
+
+    return distance, xi_b, xi_p
+
+
+def model_str(model):
+    """
+    Prints a compressed string representation of the model dict, with
+    reduced precision to reduce the size of the record saved to the .h5
+    file
+
+    :param model: model dictionary as returned by runmodel
+
+    :return: string representation of the model dict
+    """
+
+    return ("{'time': ["+','.join(['{:.4f}'.format(x) for x in model['time']]) \
+        +"], 'mdot': ["+','.join(['{:.5f}'.format(x) for x in model['mdot']]) \
+        +"], 'alpha': ["+','.join(['{:.3f}'.format(x) for x in model['alpha']]) \
+        +"], 'e_b': ["+','.join(['{:.4f}'.format(x) for x in model['e_b']]) \
+        +"]}").replace(' ','')
+
+
+def mean_flux_spline(t1, t2, bean):
+    """
+    Calculates the mean flux between t1 and t2 from the spline set up at
+    the __init__ phase
+
+    :param t1: start time for averaging
+    :param t2: end time for averaging
+    :param bean: Beans object, from which the remaining parameters are drawn:
+      tck_s
+
+    :result: mean flux
+    """
+
+    return splint(t1,t2,bean.tck_s)/(t2-t1)
+
+
+def mean_flux_linear(t1, t2, bean):
+    """
+    Calculates the mean flux between t1 and t2 from the piecewise linear
+    interpolation of tobs,a,b
+
+    :param t1: start time for averaging
+    :param t2: end time for averaging
+    :param bean: Beans object, from which the remaining parameters are drawn:
+      tobs, a, b
+
+    :result: mean flux
+    """
+
+    tobs, a, b = bean.tobs, bean.a, bean.b
+    na = len(a)
+
+    if len(tobs) != na + 1 or len(b) != na:
+        print("** ERROR ** some problem with tobs, a, b arrays")
+        return -1
+    # i1 is max of where t1 > tobs
+
+    i1 = max(np.where(t1 > tobs))
+    if len(i1) == 0:
+        i1 = -1
+    else:
+        i1 = max(i1)
+
+    i2 = max(np.where(t2 > tobs))
+    if len(i2) == 0:
+        i2 = -1
+    else:
+        i2 = max(i2)
+
+    sum = 0.0
+    if (i1 < 0) and (i2 < 0):
+
+        # Modified this section to just report the flux from the first measurement
+
+        sum += (t2 - t1) * (a[0] + b[0] * tobs[0])
+    else:
+
+        # Add the contribution from the start time through to tobs[0], using the
+        # gradient between the first pair of observations
+
+        if i1 < 0:
+            sum = sum + (tobs[0] - t1) * np.mean(
+                [a[0] + b[0] * t1, a[0] + b[0] * tobs[0]]
+            )
+
+        # Add the contributions between each pair of observations
+
+        for i in range(max([0, i1]), min([i2, na - 1]) + 1):
+            sum = sum + (min([t2, tobs[i + 1]]) - max([t1, tobs[i]])) * np.mean(
+                [a[i] + b[i] * max([t1, tobs[i]]), a[i] + b[i] * min([t2, tobs[i + 1]])]
+            )
+
+        # Add the contribution for the last section which overlaps with the
+        # observation times
+
+        if i1 < na and i2 == na:
+            sum = sum + (t2 - tobs[i2]) * np.mean(
+                [a[i2 - 1] + b[i2 - 1] * tobs[i2], t2]
+            )
+
+        # Now add any contribution *completely* beyond the observations. Previously
+        # this gave an exception
+
+        if i1 == na and i2 == na:
+            sum = sum + (t2 - t1) * np.mean(
+                [a[na - 1] + b[na - 1] * t1, a[na - 1] + b[na - 1] * t2]
+            )
+
+    return sum / (t2 - t1)
+
+
+def get_a_b(pflux, pfluxe, tobs):
+    """
+    Do piecewise continuous fits to the flux evolution, to determine the
+    appropriate parameters for each interval for use by mean_flux_linear:
+
+    :param pflux: persistent flux measurements to interpolate
+    :param pfluxe: uncertainty on persistent flux (not used)
+    :param tobs: time (midpoint of observation extent) for flux measurement
+    :result: a, b arrays for use with mean_flux
+    """
+
+    # Now actually calculate the coefficients for the flux fit
+
+    # Linear fit
+    ng = len(tobs)
+
+    b0 = np.zeros(ng - 1)
+    a0 = np.zeros(ng - 1)
+
+    for i in range(1, ng):
+        b0[i - 1] = (pflux[i] - pflux[i - 1]) / (tobs[i] - tobs[i - 1])
+        a0[i - 1] = pflux[i - 1] - b0[i - 1] * tobs[i - 1]
+
+    return a0, b0
+
+
 class Beans:
     """
     The main object class that includes the basic functionality required for
@@ -118,11 +294,20 @@ class Beans:
     bursts ("ensemble" mode)
     """
 
+    HAS_CONCORD = False
+    try:
+        # Required for the distance_limit method
+        import concord as cd
+        HAS_CONCORD = True
+    except:
+        pass
+
     def __init__(self, config_file=None, nwalkers=200, nsteps=100,
                  run_id="test", obsname=None, burstname=None, gtiname=None,
                  theta= (0.44, 0.01, 0.18, 2.1, 3.5, 0.108, 0.90, 0.5, 1.4, 11.2),
                  numburstssim=3, bc=2.21, ref_ind=1, prior=prior_func,
-                 threads = 4, test_model=True, restart=False, **kwargs):
+                 threads = 4, test_model=True, restart=False, 
+                 interp='linear', smooth=0.02, **kwargs):
         """
         Initialise a Beans object
 
@@ -155,6 +340,9 @@ class Beans:
           cores your computer has). Set to None to use all available
         :param test_model: flag to test the model during the setup process
         :param restart: set to True to continue a previously interrupted run
+        :param interp: interpolation mode for the flux; possible values are
+          'linear', or 'spline'
+        :param smooth: smoothing factor for spline interpolation
         :result: Beans object including all the required data
         """
 
@@ -188,6 +376,8 @@ class Beans:
         if burstname is None:
             burstname = os.path.join(data_path, '1808_bursts.txt')
 
+        self.lnprior = prior
+
         # Set up initial conditions:
 
         if config_file is not None:
@@ -201,42 +391,67 @@ class Beans:
             self.nwalkers = nwalkers
             self.nsteps = nsteps
             self.run_id = run_id
+            self.obsname = obsname
+            self.burstname = burstname
+            self.gtiname = gtiname
             self.theta = theta
+            self.bc = bc
+            self.ref_ind = ref_ind
             self.threads = threads
             self.numburstssim = numburstssim
             # number of bursts observed (redundant; set below after reading the data)
             # self.numburstsobs = numburstsobs
-            self.ref_ind = ref_ind
-            self.obsname = obsname
-            self.burstname = burstname
-            self.gtiname = gtiname
-            self.bc = bc
 
-        self.lnprior = prior
+        if self.lnprior(self.theta) == -np.inf:
+            print ('** ERROR ** supplied parameter vector is excluded by the prior')
+            return
+
+        # below set the parameters which are not part of the config
+        # file
+
         self.restart = restart
 
         # number of dimensions for the parameter array
-        # self.ndim = ndim
-        self.ndim = len(theta)
 
-        # self.gti_checking = gti_checking
-        self.gti_checking = gtiname is not None
+        self.ndim = len(self.theta)
+
+        self.gti_checking = self.gtiname is not None
 
 	# determines whether will run as a train of bursts or non-contiguous
 	# bursts ("ensemble" mode); previously numerical, default is 1 (True),
 	# which means a burst train will be generated; set obsname=None for
 	# non-contiguous (ensemble mode) run
 
-        self.train = (obsname is not None)
+        self.train = (self.obsname is not None)
+
+        self.bstart_err = BSTART_ERR.to('d').value
 
         # Read in all the measurements and set up all the parameters
+        # This function now operates on the Beans object directly, and the
+        # required attributes:
+        # x, y, yerr, tref, bstart, pflux, pfluxe, tobs, fluen, fluen_err, 
+        #     st, et
+        # are set in that routine
+        # bypasses the earlier init function, and instead calls get_obs
+        # directly
 
-        self.x, self.y, self.yerr, self.tref, self.bstart, self.pflux, \
-            self.pfluxe, self.tobs, self.fluen, self.st, self.et = init(
-            self.ref_ind, self.gti_checking, self.obsname, self.burstname,
-            self.gtiname, self.bc)
+        get_obs(self)
+
         self.numburstsobs = len(self.fluen)
-        print(self.st, self.et)
+
+        # Set interpolation mode, and define averaging function
+
+        if not hasattr(self, 'interp'):
+            self.interp = interp
+        assert self.interp in ('linear','spline')
+        if self.interp == 'linear':
+            self.a, self.b = get_a_b(self.pflux, self.pfluxe, self.tobs)
+            self.mean_flux = mean_flux_linear
+        else:
+            if not hasattr(self, 'smooth'):
+                self.smooth = smooth
+            self.tck_s = splrep(self.tobs, self.pflux, s=self.smooth)
+            self.mean_flux = mean_flux_spline
 
 
         # # -------------------------------------------------------------------------#
@@ -250,10 +465,7 @@ class Beans:
             print("Testing the model works..")
 
 
-            test, valid, test2 = runmodel(self.theta, self.y, self.tref, self.bstart,
-                                   self.pflux, self.pfluxe, self.tobs, self.numburstssim,self.numburstsobs, self.ref_ind,
-                                   self.gti_checking, self.train,self.st, self.et,
-                                   debug=False) # set debug to True for testing
+            test, valid, test2 = runmodel(self.theta, self, debug=False) # set debug to True for testing
             print("result: ", test, valid)
 
             # MCU Note: commented out - no interactive windows for automated testing
@@ -302,15 +514,18 @@ Initial parameters:
 
         X, Z, Q_b, f_a, f_E, r1, r2, r3, mass, radius = theta
 
-        return """#X = {} \ hydrogen mass fraction
-#Z = {} \ CNO mass fraction
-#Q_b = {} \ base flux [MeV/nucleon]
-#M_NS = {} M_sun \ neutron star mass
-#R_NS = {} km \ neutron star radius
-#f_a, f_E = {}, {} \ systematic error terms for alpha, fluence
-#r_1, r_2, r_3 = {}, {}, {} \ scaling factors to convert predictions""".format(
-            X, Z, Q_b, mass, radius, f_a, f_E, r1, r2, r3).replace(
-            '#',' '*indent)
+        dist, xi_b, xi_p = calc_dist_anisotropy(r1, r2, r3)
+
+        return """#X = {} \\ hydrogen mass fraction
+#Z = {} \\ CNO mass fraction
+#Q_b = {} \\ base flux [MeV/nucleon]
+#M_NS = {} M_sun \\ neutron star mass
+#R_NS = {} km \\ neutron star radius
+#f_a, f_E = {}, {} \\ systematic error terms for alpha, fluence
+#r_1, r_2, r_3 = {}, {}, {} \\ scaling factors to convert predictions
+#  (equivalent to d = {:.2f} kpc, xi_b = {:.3f}, xi_p = {:.3f})""".format(
+    X, Z, Q_b, mass, radius, f_a, f_E, r1, r2, r3, dist, xi_b, xi_p).replace(
+    '#',' '*indent)
 
 
     def save_config(self, file=None, clobber=True):
@@ -344,11 +559,14 @@ Initial parameters:
            Config.set("data", "ref_ind", str(self.ref_ind))
            Config.set("data", "gtiname", str(self.gtiname))
            Config.set("data", "bc", str(self.bc))
+           Config.set("data", "interp", str(self.interp))
+           if self.interp == 'spline':
+               Config.set("data", "smooth", str(self.smooth))
 
            Config.add_section("emcee")
            Config.set("emcee", "theta", str(self.theta))
            Config.set("emcee", "numburstssim", str(self.numburstssim))
-           # Config.set("emcee", "prior", str(self.lnprior))
+           Config.set("emcee", "prior", str(self.lnprior))
            Config.set("emcee", "nwalkers", str(self.nwalkers))
            Config.set("emcee", "nsteps", str(self.nsteps))
            Config.set("emcee", "threads", str(self.threads))
@@ -370,6 +588,7 @@ Initial parameters:
             run_id = os.path.join(data_path, 'beans.ini')
 
         int_params = ('ref_ind','numburstssim','nwalkers','nsteps','threads')
+        float_params = ('bc', 'smooth')
 
         if not os.path.isfile(file):
             print ('** ERROR ** config file not found')
@@ -389,8 +608,15 @@ Initial parameters:
                 if option == 'theta':
                     setattr(self, option, 
                         tuple(map(float, config.get(section, option)[1:-1].split(', '))))
-                elif option == 'bc':
+                elif option in float_params:
                     setattr(self, option, config.getfloat(section, option))
+                elif option =='prior':
+                    function_name = config.get(section, option).split(' ')[1]
+                    if function_name != str(self.lnprior).split(' ')[1]:
+                        print ('''
+** WARNING ** config file lists prior function as {}, but supplied prior is {}
+              To fully replicate the previous run you need to specify the same prior using the prior flag on init
+'''.format(function_name, self.lnprior))
                 elif option in int_params:
                     setattr(self, option, config.getint(section, option))
                 else:
@@ -420,46 +646,17 @@ Initial parameters:
         :return: likelihood, model result array
         """
 
-        # define y = "data" parameters
-        # I think these "globals" are not used; the only other reference I 
-        # can see is in run_model, which is commented out. So I think
-        # TODO these siz for loops can be deleted - dkg
-
-        for x,i in zip([ x for x in range(0, len(self.bstart)-1) if x != self.ref_ind], [i for i in range(0, len(self.bstart)-1) if i != self.ref_ind]):
-            globals()['t%s' % i] = self.y[x]
-        for x,i in zip(range(len(self.bstart)-1, len(self.fluen)+len(self.bstart)-1),range(0,len(self.bstart))):
-            globals()['Eb%s' % i] = self.y[x]
-        for x,i in zip(range(len(self.fluen)+len(self.bstart)-1, len(self.y)),range(0, len(self.bstart-1))):
-            globals()['a%s' % i] = self.y[x]
-
-    # define yerr as variance terms (errors) for our data parameters (listed in same order as for y)
-    # *note that we have to enter three time errors for the code to work however in reality the error should be the same for all of them (st0, st2 and st3 are really dummy parameters)
-
-        for x,i in zip([ x for x in range(0, len(self.bstart)-1) if x != self.ref_ind], [i for i in range(0, len(self.bstart)-1) if i != self.ref_ind]):
-            globals()['st%s' % i] = self.yerr[x]
-        for x,i in zip(range(len(self.bstart)-1, len(self.fluen)+len(self.bstart)-1),range(0,len(self.bstart))):
-            globals()['sEb%s' % i] = self.yerr[x]
-        for x,i in zip(range(len(self.fluen)+len(self.bstart)-1, len(self.y)),range(0, len(self.bstart-1))):
-            globals()['sa%s' % i] = self.yerr[x]
-
-
         # define theta = model parameters, which we define priors for
 
         X, Z, Q_b, f_a, f_E, r1, r2, r3, mass, radius = theta_in
 
-        # Instead of treating s_t as a parameter, we just hardwire it here
-
-        s_t = 10.0 / 1440.0
-
-	      # call model (function runmodel, in run_model.py) to generate the burst
-	      # train, or the set of bursts (for "ensemble" mode. In earlier versions
-	      # the corresponding IDL function was defined as
+	# call model (function runmodel, in run_model.py) to generate the burst
+	# train, or the set of bursts (for "ensemble" mode. In earlier versions
+	# the corresponding IDL function was defined as
         # modeldata(base, z, x, r1, r2 ,r3)
 
-        model, valid, model2 = runmodel(
-            theta_in, y, self.tref, self.bstart, self.pflux, self.pfluxe, self.tobs,self.numburstssim,self.numburstsobs, self.ref_ind, self.gti_checking,self.train,
-             self.st, self.et
-        )
+        assert np.allclose(y, self.y)
+        model, valid, model2 = runmodel( theta_in, self)
         if not valid:
             return -np.inf, model
 
@@ -471,38 +668,23 @@ Initial parameters:
         ato = int(self.train) # array "train" offset
         # special to trap "unhashable type" error
         # print (model, ato, len(self.bstart), len(self.fluen))
-        model[len(self.bstart)-ato:len(self.fluen)+len(self.bstart)-ato] *= r3
-        model[len(self.fluen)+len(self.bstart)-ato:] *= r2
+        model[self.numburstsobs-ato:len(self.fluen)+self.numburstsobs-ato] *= r3
+        model[len(self.fluen)+self.numburstsobs-ato:] *= r2
 
 	# To simplify final likelihood expression we define inv_sigma2 for each
 	# data parameter that describe the error.  The variance (eg sEb0) is
 	# underestimated by some fractional amount, f, for each set of
 	# parameters.
-        # TODO: assembling inv_sigma2 can probably all be done in one line
 
-        sEb = yerr[len(self.bstart)-ato:len(self.fluen)+len(self.bstart)-ato]
-        sa = yerr[len(self.fluen)+len(self.bstart)-ato:]
-
-        inv_sigma2 = []
-        if self.train:
-            for i in range (0,len(self.bstart)-1):
-                inv_sigma2.append(1.0/(s_t**2))
-        else:
-            for i in range (0,len(self.bstart)):
-                inv_sigma2.append(1.0/(yerr[i]**2))
-        for i in range(0,len(self.bstart)):
-            inv_sigma2.append(1.0/((sEb[i]*f_E)**2))
-        for i in range(0,len(self.bstart)-ato):
-            inv_sigma2.append(1.0/((sa[i]*f_a)**2))
+        err_fac = np.concatenate(( np.full(self.numburstsobs-ato,1.),
+            np.full(self.numburstsobs,f_E), np.full(self.numburstsobs-ato,f_a)))
+        inv_sigma2 = 1./(yerr*err_fac)**2
 
         # Final likelihood expression
         cpts = (self.y - (model)) ** 2 * inv_sigma2 - (np.log(inv_sigma2))
 
         # Test if the result string is defined here. It is, so we return the selected elements of result
         # instead of the downselection in model
-
-        model2 = str(model2).encode('ASCII')
-
 
         # Now also return the model
         return -0.5 * np.sum(cpts), model2
@@ -535,29 +717,42 @@ Initial parameters:
         if (not np.isfinite(like)):
             return -np.inf, -np.inf, model
 
-        # we return the logprobability as well as the theta parameters at this point so we can extract results later
-        return lp + like, lp, model
+        # encoding below is so we have a suitable object for including in
+        # the blobs (see the dtype specification in runemcee)
+
+        return lp + like, lp, model_str(model).encode('ASCII')
 
 
-    def plot_model(self, model=None, mdot=True):
+
+    def plot_model(self, model=None, mdot=True, title=None):
         """
-        Display a plot of the model results, for a burst train calculated with generate_burst_train
-        Adapted from the example at https://matplotlib.org/gallery/api/two_scales.html
+	Display a plot of the model results, for a burst train calculated
+	with generate_burst_train Adapted from the example at
+        https://matplotlib.org/gallery/api/two_scales.html
 
         :param model: array of packed model prediction, OR dict giving full
           model results
         :param mdot: flag to show mdot rather than flux (only possible if
           you're passing the full model)
+        :param title: add a title, if required
         """
+
         tobs = self.bstart
         ebobs = self.fluen
 
+        # for the default linear interpolation connect the flux
+        # measurements by lines
+
+        ls = '-'
+        if self.interp == 'spline':
+            ls = ''
+
+        # the ratios are no longer part of the model, so extract them from the param array here
+
+        r1, r2, r3 = self.theta[5:8]
+
         if model is None:
-            test, valid, model = runmodel(self.theta, self.y, self.tref,
-                self.bstart, self.pflux, self.pfluxe, self.tobs,
-                self.numburstssim, self.numburstsobs, self.ref_ind,
-                self.gti_checking, self.train,self.st, self.et,
-                debug=False)
+            test, valid, model = runmodel(self.theta, self, debug=False)
 
         full_model = False  # Flag to remember whether we're plotting the full model output of
                             # generate burst train or the packed output array
@@ -568,13 +763,13 @@ Initial parameters:
             if len(timepred) == 0:
                 print ('** ERROR ** no predicted times to show')
                 return
-            ebpred = np.array(model["e_b"])*np.array(model["r3"])
+            # ebpred = np.array(model["e_b"])*np.array(model["r3"])
+            ebpred = np.array(model["e_b"])*np.array(r3)
         else:
             # The other way to return the model is as an array with the burst times, fluences
             # and alphas all together. So unpack those here
             timepred = model[:self.numburstssim+1]
-            # Don't have access to the r3 value to scale, as we did for ebpred above
-            ebpred = np.array(model[self.numburstssim+int(self.train):self.numburstssim*2+int(self.train)])*self.theta[6]
+            ebpred = np.array(model[self.numburstssim+int(self.train):self.numburstssim*2+int(self.train)])*r3
 
         fig, ax1 = plt.subplots()
         # fig.figure(figsize=(10,7))
@@ -586,18 +781,25 @@ Initial parameters:
         if mdot and full_model:
             ax1.set_ylabel('Accretion rate (fraction of Eddington)', color=flux_color)
             if self.train:
-                ax1.errorbar(self.tobs, self.pflux*model['r1'], self.pfluxe*model['r1'], marker='.',
-                         color=flux_color, label='mdot')
+                ax1.errorbar(self.tobs, self.pflux*r1, self.pfluxe*r1, 
+                    marker='.', ls=ls, color=flux_color, label='mdot')
+                if self.interp == 'spline':
+                    t = np.arange(min(self.tobs), max(self.tobs), 0.1)
+                    ax1.plot(t, BSpline(*self.tck_s)(t)*r1, color=flux_color)
                 # show the time of the "reference" burst
-                ax2.axvline(timepred[model["iref"]], c='k')
+                # ax2.axvline(timepred[self.iref], c='k')
+                ax2.axvline(self.bstart[self.ref_ind], c='k')
             else:
-                ax1.errorbar(self.bstart, self.pflux*model['r1'], self.pfluxe*model['r1'], fmt='.',
+                ax1.errorbar(self.bstart, self.pflux*r1, self.pfluxe*r1, fmt='.',
                          color=flux_color, label='mdot')
         else:
             ax1.set_ylabel('Persistent flux', color=flux_color)
             if self.train:
-                ax1.errorbar(self.tobs, self.pflux, self.pfluxe, marker = '.',color=flux_color,
-                         label = 'pflux')
+                ax1.errorbar(self.tobs, self.pflux, self.pfluxe,  
+                    marker = '.', ls=ls, color=flux_color, label = 'pflux')
+                if self.interp == 'spline':
+                    t = np.arange(min(self.tobs), max(self.tobs), 0.1)
+                    ax1.plot(t, BSpline(*self.tck_s)(t)*r1, color=flux_color)
                 ax2.scatter(timepred[0], ebpred[0], marker = '*',color=bursts_color,s = 100)
                 ax1.set_xlabel("Time (days after start of outburst)")
             else:
@@ -615,16 +817,25 @@ Initial parameters:
                 # Plot the observed bursts, if available
                 ax2.scatter(tobs,ebobs, color = 'darkgrey', marker = '.', label='observed', s =200)
             ax2.scatter(timepred[1:], ebpred, marker = '*',color=bursts_color,s = 100, label = 'predicted')
+            # and the averaged mdot over the burst interval (predicted)
+            av_mdot = []
+            for i in range(len(timepred)-1):
+                av_mdot.append(self.mean_flux(timepred[i], timepred[i+1], self)*r1)
+            av_mdot.insert(0, av_mdot[0])
+            ax1.step(timepred, av_mdot, where='pre', color=flux_color)
         else:
             ax2.scatter(self.bstart,ebobs, color = 'darkgrey', marker = '.', label='observed', s =200)
             ax2.scatter(self.bstart, ebpred, marker = '*',color=bursts_color,s = 100, label = 'predicted')
 
         ax2.tick_params(axis='y', labelcolor=bursts_color)
 
+        ax1.set_xlabel("Time (days after outburst start)")
+        if title is not None:
+            plt.title(title)
+
         fig.tight_layout()  # otherwise the right y-label is slightly clipped
 
-        # fig.title("Initial guess of parameters")
-        fig.legend(loc=2)
+        fig.legend(loc=1)
         fig.show()
 
     # -------------------------------------------------------------- #
@@ -758,53 +969,22 @@ Initial parameters:
         # Testing the various functions. Each of these will display the likelihood value, followed by the model-results "blob"
         print("Testing the prior and likelihood functions..")
         print("lnprior:", self.lnprior(self.theta))
-        print("lnlike:", self.lnlike(self.theta, self.x, self.y, self.yerr))
-        print("lnprob:", self.lnprob(self.theta, self.x, self.y, self.yerr))
+        print("lnlike:", self.lnlike(self.theta, None, self.y, self.yerr))
+        print("lnprob:", self.lnprob(self.theta, None, self.y, self.yerr))
         print("# -------------------------------------------------------------------------#")
         # print(f"The theta parameters will begin at: {self.theta}")
         # print("# -------------------------------------------------------------------------#")
         if plot:
             print("plotting the initial guess.. (you want the predicted bursts to match approximately the observed bursts here)")
             # make plot of observed burst comparison with predicted bursts:
-            # TODO: this section can presumably be replaced by the plot_model
-            # method, which also produces a plot at this point
-            # get the observed bursts for comparison:
-            X, Z, Q_b, f_a, f_E, r1, r2, r3, mass, radius = self.theta
-            print(self.train)
-            if self.train:
-                model = generate_burst_train(
-                    Q_b,Z,X,r1,r2,r3,mass,radius,self.bstart,self.pflux,self.pfluxe,self.tobs,self.numburstssim,self.ref_ind
-                )
-            else:
-                model = burstensemble(Q_b,X,Z,r1,r2,r3,mass,radius,self.bstart,self.pflux,self.numburstsobs)
-            timepred = model["time"]
-            ebpred = np.array(model["e_b"])*np.array(model["r3"])
-    
-            # Display initial model
-            tobs = self.bstart
-            ebobs = self.fluen
-            plt.figure(figsize=(10,7))
-            plt.scatter(tobs,ebobs, color = 'black', marker = '.', label='Observed', s =200)
-            if self.train:
-                plt.scatter(timepred[1:], ebpred, marker = '*',color='darkgrey',s = 100, label = 'Predicted')
-            else:
-                # No predicted time in "ensemble" mode so we just plot the
-                # fluences, predicted and observed, as a function of epoch
-                plt.scatter(tobs, ebpred, marker='*', color='darkgrey', s=100, label='Predicted')
-            #plt.errorbar(timepred[1:], ebpred, yerr=[ebpred_errup, ebpred_errlow], xerr=[timepred_errup[1:],timepred_errlow[1:]], fmt='.', color='darkgrey')
-            #plt.errorbar(tobs, ebobs, fmt='.',color='black')
-            plt.xlabel("Time (days after start of outburst)")
-            plt.ylabel("Fluence (1e-9 erg/cm$^2$)")
-            plt.title("Initial guess of parameters")
-            plt.legend(loc=2)
-            plt.show()
+            self.plot_model(title='Initial guess of parameters')
+            value = input('Press [RETURN] to continue: ')
 
-        print("# -------------------------------------------------------------------------#")
-        print("Beginning sampling...")
         _start = time.time()
 
         # run the chains and save the output as a h5 file
-        sampler = runemcee(self.nwalkers, self.nsteps, self.theta, self.lnprob, self.x, self.y, self.yerr, self.run_id, self.restart, self.threads)
+        sampler = runemcee(self.nwalkers, self.nsteps, self.theta, self.lnprob, self.lnprior, 
+            None, self.y, self.yerr, self.run_id, self.restart, self.threads)
         print(f"...sampling complete!")
 
         _end = time.time()
@@ -940,12 +1120,13 @@ Initial parameters:
         plt.show()
 
 
-    def do_analysis(self, burnin=2000, savefig=True):
+    def do_analysis(self, options=['autocor','posteriors'], 
+                          truths=None, burnin=2000, savefig=True):
         """
         This method is for running standard analysis and displaying the
         results.
         Nothing is returned, but by default the method will create several
-        files, labeled by the run_id:
+        files, labeled by the run_id; drawn from
           {}_autocorrelationtimes.pdf (via plot_autocorr)
           {}_predictedburstscomparison.pdf
           {}chain-plot.pdf
@@ -955,6 +1136,12 @@ Initial parameters:
 
         TODO: need to reorganise a bit, and add more options
 
+        :param options: array of strings corresponding to various analysis 
+            options, listed in the analyses dict below
+        :param truths: parameter vector to overplot on (one of the) corner
+          plots (TODO: need to check if >1 corner plot are selected
+	  +truths, which will likely result in an error due to
+          incompatible number of parameters)
         :param burnin: number of steps to discard when plotting the posteriors
         :param savefig: set to True to save figures to .pdf files, False to skip
 
@@ -965,231 +1152,373 @@ Initial parameters:
         c = const.c.to('cm s-1')
         G = const.G.to('cm3 g-1 s-2')
 
-    # -------------------------------------------------------------------------#
+        # list of available analyses
 
-        # plot autocorrelation times
+        analyses = {'autocor': 'autocorrelation times as a function of timestep',
+                    'chain': 'first 300 iterations of the chains',
+                    'posteriors': 'raw posteriors and the input values',
+                    'mrcorner': 'corner plot with M, R, g and 1+z',
+                    'fig6': 'corner plot with xi_b, xi_p, d, Q_b, Z',
+                    'fig8': 'xi_b vs. xi_p and models for comparison',
+                    'comparison': 'observed and predicted burst times, fluences' }
 
-        print ("Reading in samples to calculate autocorrelation time...")
+        # check the chosen option is one of those implemented
 
-        # load in sampler:
-        reader = emcee.backends.HDFBackend(filename=self.run_id+".h5")
+        for option in options:
+            if option not in analyses.keys():
+                print ('** ERROR ** {} is not an available analysis option; choose from'.format(option))
+                for key in analyses.keys():
+                    print ('  {}: {}'.format(key, analyses[key]))
+                return
 
-        if savefig:
-            self.plot_autocorr(reader, savefile='{}_autocorrelationtimes.pdf'.format(self.run_id))
-        else:
-            self.plot_autocorr(reader, savefile=None)
-            print ('Skipping autocorrelation plot save')
-        print ("...done")
+        # ---------------------------------------------------------------------#
+        # PLOTS
+        # ---------------------------------------------------------------------#
 
-        #sampler = emcee.EnsembleSampler(self.nwalkers, self.ndim, self.lnprob, args=(self.x, self.y, self.yerr), backend=reader)
+        if not hasattr(self, 'reader'):
 
-        # Read in the full chain to get the number of steps completed
-        sampler=reader.get_chain(flat=False)
-        nsteps_completed = np.shape(sampler)[0]
+            print ("Reading in samples...")# to calculate autocorrelation time...")
 
-        # plot the chains:
+            # load in sampler:
+            self.reader = emcee.backends.HDFBackend(filename=self.run_id+".h5")
 
-        print ("Plotting the chains...")
-        labels = ["$X$","$Z$","$Q_b$","$f_a$","$f_E$","$r1$","$r2$","$r3$", "$M$", "$R$"]
-        plt.clf()
-        fig, axes = plt.subplots(self.ndim, 1, sharex=True, figsize=(8, 9))
+            # Read in the full chain to get the number of steps completed
+            self.sampler = self.reader.get_chain(flat=False)
+            self.nsteps_completed = np.shape(self.sampler)[0]
 
-        for i in range(self.ndim):
-            axes[i].plot(sampler[:,:,i].T, color="k", alpha=0.4)
-            axes[i].yaxis.set_major_locator(MaxNLocator(5))
-            axes[i].set_ylabel(labels[i])
-
-        axes[self.ndim-1].set_xlabel("step number")
-        plt.tight_layout(h_pad=0.0)
-        if savefig:
-            print ('Saving chain plot to {}chain-plot.pdf'.format(self.run_id))
-            plt.savefig(self.run_id+'chain-plot.pdf')
-        else:
-            print ('Skipping chain plot save')
-
-        plt.show()
-        print ("...done")
+            print ("... done. Got {} steps completed".format(self.nsteps_completed))
 
         # moved burnin to be a parameter, so we can pass that from do_run
 
-        if burnin >= nsteps_completed*0.9:
-            print ('** WARNING ** discarding burnin {} will leave too few steps ({} total), ignoring'.format(burnin, nsteps_completed))
+        if burnin >= self.nsteps_completed*0.9:
+            print ('** WARNING ** discarding burnin {} will leave too few steps ({} total), ignoring'.format(burnin, self.nsteps_completed))
             burnin = 0
 
-        # Also read in the "flattened" chain, for the posteriors
+        # print ("Reading in flattened samples to show posteriors...")
+        # samples = self.reader.get_chain(flat=True, discard=burnin)
+        self.samples = self.sampler[burnin:,:,:].reshape((-1,10))
 
-        print ("Reading in flattened samples to show posteriors...")
-        samples=reader.get_chain(flat=True, discard=burnin)
+        # ---------------------------------------------------------------------#
+        if 'autocor' in options:
 
-        # make plot of posterior distributions of your parameters:
-        cc = ChainConsumer()
-        cc.add_chain(samples, parameters=["X", "Z", "Qb", "fa", "fE", "r1", "r2", "r3", "M", "R"])
-        cc.plotter.plot(filename=self.run_id+"_posteriors.pdf", figsize="column")
-        print ("...done")
+            # plot autocorrelation times
 
-        # and finally read in the model realisations
-        # This loop can take a LOOOOOONG time for long runs
+            if savefig:
+                self.plot_autocorr(self.reader, savefile='{}_autocorrelationtimes.pdf'.format(self.run_id))
+            else:
+                self.plot_autocorr(self.reader, savefile=None)
+                print ('Skipping autocorrelation plot save')
+            print ("...done")
 
-        print ("Reading in and processing blobs...")
-        blobs = reader.get_blobs(flat=True)
-        # samples = reader.get_chain(discard=burnin, flat=True, thin=thin)
-        # log_prob_samples = reader.get_log_prob(discard=burnin, flat=True, thin=thin)
-        # blobs = reader.get_blobs(discard=burnin, flat=True, thin=thin)
+        #sampler = emcee.EnsembleSampler(self.nwalkers, self.ndim, self.lnprob, args=(self.x, self.y, self.yerr), backend=reader)
 
-        data = []
-        for i in range(len(blobs["model"])):
-            data.append(eval(blobs["model"][i].decode('ASCII', 'replace')))
-        print ("...done")
+        # ---------------------------------------------------------------------#
+        if 'chain' in options:
 
-    # -------------------------------------------------------------------------#
-        # get the acceptance fraction:
-        #accept = reader.acceptance_fraction/nsteps #this will be an array with the acceptance fraction for each walker
-        #print(f"The average acceptance fraction of the walkers is: {np.mean(accept)}")
+            # plot the chains:
 
-        # get the autocorrelation times:
-        # print("burn-in: {0}".format(burnin))
-        # print("thin: {0}".format(thin))
-        # print("flat chain shape: {0}".format(samples.shape))
-        # print("flat log prob shape: {0}".format(log_prob_samples.shape))
-        # print("flat log prior shape: {0}".format(log_prior_samples.shape))
+            print ("Plotting the chains...")
+            labels = ["$X$","$Z$","$Q_b$","$f_a$","$f_E$","$r1$","$r2$","$r3$", "$M$", "$R$"]
+            # plt.clf()
+            fig, axes = plt.subplots(self.ndim, 1, sharex=True, figsize=(8, 9))
 
-    # -------------------------------------------------------------------------#
-        # Get parameters for each model run from the blobs structure:
+            for i in range(self.ndim):
+                axes[i].plot(self.sampler[:,:,i].T, color="k", alpha=0.4)
+                axes[i].yaxis.set_major_locator(MaxNLocator(5))
+                axes[i].set_ylabel(labels[i])
 
-        # get each individual parameter:
-        time = [data[i]['time'] for i in range(len(data))]
-        e_b = [data[i]['e_b'] for i in range(len(data))]
-        alpha = [data[i]['alpha'] for i in range(len(data))]
-        X = [data[i]['x_0'] for i in range(len(data))]
-        Z = [data[i]['z'] for i in range(len(data))]
-        base = [data[i]['base'] for i in range(len(data))]
-        mdot = [data[i]['mdot'] for i in range(len(data))]
-        r1 = np.array([data[i]['r1'] for i in range(len(data))])
-        r2 = np.array([data[i]['r2'] for i in range(len(data))])
-        r3 = np.array([data[i]['r3'] for i in range(len(data))])
-        mass = np.array([data[i]['mass'] for i in range(len(data))])
-        radius = np.array([data[i]['radius'] for i in range(len(data))])
+            axes[self.ndim-1].set_xlabel("step number")
+            plt.tight_layout(h_pad=0.0)
+            if savefig:
+                print ('Saving chain plot to {}chain-plot.pdf'.format(self.run_id))
+                plt.savefig(self.run_id+'chain-plot.pdf')
+            else:
+                print ('Skipping chain plot save')
 
-        # calculate redshift and gravity from mass and radius:
-        # keep the parameters that we're going to calculate limits on below, 
-        # dimensionless
+            plt.show()
+            print ("...done")
 
-        R = np.array(radius)*1e5*u.cm #cgs
-        M = np.array(mass)*const.M_sun.to('g') #cgs
+        # ---------------------------------------------------------------------#
+        if 'posteriors' in options:
 
-	# ChainConsumer's plot method can't handle Quantity objects, so we need
-	# to convert gravity and redshift back to numpy arrays here
-        redshift = np.power((1 - (2*G*M/(R*c**2))), -0.5).value
-        gravity = (M*redshift*G/R**2 / (u.cm/u.s**2)).value #cgs
+            # Also read in the "flattened" chain, for the posteriors
 
-        # calculate distance and inclincation from scaling factors:
-        r1 = np.array(r1)
-        r2 = np.array(r2)
-        r3 = np.array(r3)
-        print(np.min(r1))
-        print(np.min(r2))
-        print(np.min(r3))
-        print(np.min(mass))
-        print(np.min(X))
+            # make plot of posterior distributions of your parameters:
+            cc = ChainConsumer()
+            cc.add_chain(self.samples, parameters=["X", "Z", "Qb", "fa", "fE", "r1", "r2", "r3", "M", "R"])
 
-        xip = np.power( (r1*r2*r3*1e3)/(63.23*0.74816), 0.5)
-        xib = (0.74816*xip)/r2
-        distance = 10*np.power((r1/xip), 0.5) #kpc
-        cosi_2 = 1/(2*xip)
-        cosi = 0.5/(2*(xip/xib)-1)
+            if truths is None:
+                truths = list(self.theta)
 
+            if savefig:
+                cc.plotter.plot(filename=self.run_id+"_posteriors.pdf",
+                    figsize="page", truth=truths)
+            else:
+                fig = cc.plotter.plot(figsize="page", truth=truths)
+                fig.show()
+            print ("...done")
 
-        # to get the parameter middle values and uncertainty use the functions get_param_uncert_obs and get_param_uncert_pred, e.g.
+        # ---------------------------------------------------------------------#
+        if (('mrcorner' in options) or ('comparison' in options) \
+            or ('fig6' in options) or ('fig8' in options)):
+            # maybe can try to record that we've already read these
+            # parameters in, like so
+            # and (self.burnin_excluded != burnin):
 
-        #t1, t2, t3, t4, t5, t6, t7 = get_param_uncert_obs1(time, self.numburstssim+1)
-        #times = [list(t1), list(t2), list(t3), list(t4), list(t5), list(t6), list(t7)]
-        if self.train:
-            times = get_param_uncert_obs(time, self.numburstssim*2+1)
-        else:
-            times = get_param_uncert_obs(time, self.numburstsobs)
-        timepred = [x[0] for x in times]
-        timepred_errup = [x[1] for x in times]
-        timepred_errlow = [x[2] for x in times]
+            # and finally read in the model realisations
+            # This loop can take a LOOOOOONG time for long runs
+            # TODO save this to the Beans object so we only need to read
+            # it in once; need to rationalise what arrays are kept etc.
 
-        if self.train:
-            ebs = get_param_uncert_obs(e_b, self.numburstssim*2)
-        else:
-            ebs = get_param_uncert_obs(e_b, self.numburstsobs)
-        ebpred = [x[0] for x in ebs]
-        ebpred_errup = [x[1] for x in ebs]
-        ebpred_errlow = [x[2] for x in ebs]
-        if self.train:
-            alphas = get_param_uncert_obs(alpha, self.numburstssim*2)
-        else:
-            alphas = get_param_uncert_obs(alpha, self.numburstssim)
-        Xpred = np.array(list(get_param_uncert(X))[0])
-        Zpred = np.array(list(get_param_uncert(Z))[0])
-        basepred = np.array(list(get_param_uncert(base))[0])
-        dpred = np.array(list(get_param_uncert(distance))[0])
-        cosipred = np.array(list(get_param_uncert(cosi))[0])
-        xippred = np.array(list(get_param_uncert(xip))[0])
-        xibpred = np.array(list(get_param_uncert(xib))[0])
-        masspred = np.array(list(get_param_uncert(mass))[0])
-        radiuspred = np.array(list(get_param_uncert(radius))[0])
-        gravitypred = np.array(list(get_param_uncert(gravity))[0])
-        redshiftpred = np.array(list(get_param_uncert(redshift))[0])
-        r1pred = np.array(list(get_param_uncert(r1))[0])
-        r2pred = np.array(list(get_param_uncert(r2))[0])
-        r3pred = np.array(list(get_param_uncert(r3))[0])
+            print ("Reading in and processing blobs, ignoring first {}...".format(burnin))
+            blobs = self.reader.get_blobs(flat=True)
 
-        # scale fluences by scaling factor:
-        ebpred = np.array(ebpred)*np.array(r3pred[0])
-        ebpred_errup = np.array(ebpred_errup)*np.array(r3pred[0])
-        ebpred_errlow = np.array(ebpred_errlow)*np.array(r3pred[0])
+            # Get predictions for each model run from the blobs structure:
 
-        # save to text file with columns: paramname, value, upper uncertainty, lower uncertainty
+            time, e_b, alpha, mdot = [], [], [], []
+            # X = [] # just for testing; won't be included in future blobs
+            for i in range(burnin*self.nwalkers, len(blobs["model"])):
+                _model = eval(blobs["model"][i].decode('ASCII', 'replace'))
+                time.append(_model['time'])
+                e_b.append(_model['e_b'])
+                alpha.append(_model['alpha'])
+                mdot.append(_model['mdot'])
+                # X.append(_model['x_0'][0])
+            print ("...done")
 
-        np.savetxt(f'{self.run_id}_parameterconstraints_pred.txt', (Xpred, Zpred, basepred, dpred, cosipred, xippred, xibpred, masspred, radiuspred,gravitypred, redshiftpred, r1pred, r2pred, r3pred) , header='Xpred, Zpred, basepred, dpred, cosipred, xippred, xibpred, masspred, radiuspred,gravitypred, redshiftpred, r1pred, r2pred, r3pred \n value, upper uncertainty, lower uncertainty')
+            # we don't include these in the blobs anymore, to save space
+            # (and they're redundant, as also included in the samples)
+            # X = [data[i]['x_0'][0] for i in range(len(data))]
+            # Z = [data[i]['z'][0] for i in range(len(data))]
+            # base = [data[i]['base'][0] for i in range(len(data))]
+            # r1 = np.array([data[i]['r1'][0] for i in range(len(data))])
+            # r2 = np.array([data[i]['r2'][0] for i in range(len(data))])
+            # r3 = np.array([data[i]['r3'][0] for i in range(len(data))])
+            # mass = np.array([data[i]['mass'][0] for i in range(len(data))])
+            # radius = np.array([data[i]['radius'][0] for i in range(len(data))])
+            # assert np.allclose(X, self.samples[:,0])
+            X = self.samples[:,0]
+            Z = self.samples[:,1]
+            base = self.samples[:,2]
+            r1 = self.samples[:,5]
+            r2 = self.samples[:,6]
+            r3 = self.samples[:,7]
+            mass = self.samples[:,8]
+            radius = self.samples[:,9]
 
-    # -------------------------------------------------------------------------#
-    # PLOTS
-    # -------------------------------------------------------------------------#
+            # calculate redshift and gravity from mass and radius:
+	    # keep the parameters that we're going to calculate limits on
+	    # below, dimensionless
 
-        # make plot of posterior distributions of the mass, radius, surface gravity, and redshift:
-        # stack data for input to chainconsumer:
-        mass = mass.ravel()
-        radius = radius.ravel()
-        gravity = np.array(gravity).ravel()
-        redshift = redshift.ravel()
-        mrgr = np.column_stack((mass, radius, gravity, redshift))
+            R = np.array(radius)*1e5*u.cm #cgs
+            M = np.array(mass)*const.M_sun.to('g') #cgs
 
-        # plot with chainconsumer:
-        cc = ChainConsumer()
-        cc.add_chain(mrgr, parameters=["M", "R", "g", "1+z"])
-        cc.plotter.plot(filename=self.run_id+"_massradius.pdf",figsize="column")
+	    # ChainConsumer's plot method can't handle Quantity objects,
+	    # so we need to convert gravity and redshift back to numpy
+	    # arrays here
+            redshift = np.power((1 - (2*G*M/(R*c**2))), -0.5).value
+            gravity = (M*redshift*G/R**2 / (u.cm/u.s**2)).value #cgs
 
-        # make plot of observed burst comparison with predicted bursts:
-        # get the observed bursts for comparison:
-        tobs = self.bstart
-        ebobs = self.fluen
+            # calculate distance and inclincation from scaling factors:
 
-        plt.figure(figsize=(10,7))
+            distance, xib, xip = calc_dist_anisotropy(r1, r2, r3)
 
-        plt.scatter(tobs,ebobs, color = 'black', marker = '.', label='Observed', s =200)
-        #plt.scatter(time_pred_35, e_b_pred_35, marker = '*',color='cyan',s = 200, label = '2 M$_{\odot}$, R = 11.2 km')
-        if self.train:
-            plt.scatter(timepred[1:], ebpred, marker='*', color='darkgrey', s=100, label='Predicted')
-            plt.errorbar(timepred[1:], ebpred, yerr=[ebpred_errup, ebpred_errlow],xerr=[timepred_errup[1:], timepred_errlow[1:]], fmt='.', color='darkgrey')
-            plt.errorbar(tobs, ebobs, fmt='.', color='black')
-        else:
-            plt.scatter(timepred, ebpred, marker='*', color='darkgrey', s=100, label='Predicted')
-            plt.errorbar(timepred, ebpred, yerr=[ebpred_errup, ebpred_errlow],xerr=[timepred_errup, timepred_errlow], fmt='.', color='darkgrey')
-            plt.errorbar(tobs, ebobs, fmt='.', color='black')
+            cosi_2 = 1/(2*xip)
+            cosi = 0.5/(2*(xip/xib)-1)
 
-        plt.xlabel("Time (days after start of outburst)")
-        plt.ylabel("Fluence (1e-9 erg/cm$^2$)")
-        plt.legend(loc=2)
+	    # to get the parameter middle values and uncertainty use the
+	    # functions get_param_uncert_obs and get_param_uncert_pred,
+	    # e.g.
 
-        if savefig:
-            print ('Saving burst comparison plot to {}_predictedburstscomparison.pdf'.format(self.run_id))
-            plt.savefig(f'{self.run_id}_predictedburstscomparison.pdf')
-        else:
-            print ('Skipping burst comparison plot save')
-        plt.show()
+            if self.train:
+                times = get_param_uncert_obs(time, self.numburstssim*2+1)
+            else:
+                times = get_param_uncert_obs(time, self.numburstsobs)
+            timepred = [x[0] for x in times]
+            timepred_errup = [x[1] for x in times]
+            timepred_errlow = [x[2] for x in times]
+
+            if self.train:
+                ebs = get_param_uncert_obs(e_b, self.numburstssim*2)
+            else:
+                ebs = get_param_uncert_obs(e_b, self.numburstsobs)
+            ebpred = [x[0] for x in ebs]
+            ebpred_errup = [x[1] for x in ebs]
+            ebpred_errlow = [x[2] for x in ebs]
+            if self.train:
+                alphas = get_param_uncert_obs(alpha, self.numburstssim*2)
+            else:
+                alphas = get_param_uncert_obs(alpha, self.numburstssim)
+
+            Xpred = get_param_uncert(X)
+            Zpred = get_param_uncert(Z)
+            basepred = get_param_uncert(base)
+            dpred = get_param_uncert(distance)
+            cosipred = get_param_uncert(cosi)
+            xippred = get_param_uncert(xip)
+            xibpred = get_param_uncert(xib)
+            masspred = get_param_uncert(mass)
+            radiuspred = get_param_uncert(radius)
+            gravitypred = get_param_uncert(gravity)
+            redshiftpred = get_param_uncert(redshift)
+            r1pred = get_param_uncert(r1)
+            r2pred = get_param_uncert(r2)
+            r3pred = get_param_uncert(r3)
+
+            # scale fluences by scaling factor:
+            ebpred = np.array(ebpred)*np.array(r3pred[0])
+            ebpred_errup = np.array(ebpred_errup)*np.array(r3pred[0])
+            ebpred_errlow = np.array(ebpred_errlow)*np.array(r3pred[0])
+
+            # save to text file with columns: paramname, value, upper uncertainty, lower uncertainty
+
+            np.savetxt(f'{self.run_id}_parameterconstraints_pred.txt', (Xpred, Zpred, basepred, dpred, cosipred, xippred, xibpred, masspred, radiuspred,gravitypred, redshiftpred, r1pred, r2pred, r3pred) , header='Xpred, Zpred, basepred, dpred, cosipred, xippred, xibpred, masspred, radiuspred,gravitypred, redshiftpred, r1pred, r2pred, r3pred \n value, upper uncertainty, lower uncertainty')
+
+	    # make plot of posterior distributions of the mass, radius,
+	    # surface gravity, and redshift: stack data for input to
+	    # chainconsumer:
+            mass = mass.ravel()
+            radius = radius.ravel()
+            gravity = np.array(gravity).ravel()
+            redshift = redshift.ravel()
+
+        # ---------------------------------------------------------------------#
+        if 'mrcorner' in options:
+
+            mrgr = np.column_stack((mass, radius, gravity, redshift))
+
+            # plot with chainconsumer:
+            cc = ChainConsumer()
+            cc.add_chain(mrgr, parameters=["M", "R", "g", "1+z"])
+            if savefig:
+                cc.plotter.plot(filename=self.run_id+"_massradius.pdf",
+                    truth=truths, figsize="page")
+            else:
+                fig = cc.plotter.plot(figsize="page", truth=truths)
+                fig.show()
+
+        # ---------------------------------------------------------------------#
+        if 'fig6' in options:
+
+            # fig6data = np.column_stack((xip, xib, distance, base, Z, X))
+            fig6data = np.column_stack((X, Z, base, distance, xib, xip))
+
+            # plot with chainconsumer:
+
+            cc = ChainConsumer()
+
+            # configure params below copied from Adelle's jupyter notebook
+            cc.add_chain(fig6data, parameters=["X", "$Z$", "$Q_b$ (MeV)",
+                "$d$ (kpc)", "$\\xi_b$", "$\\xi_p$"])\
+                .configure(flip=False, bins=0.7, summary=False, \
+                diagonal_tick_labels=False, max_ticks=3, shade=True, \
+                shade_alpha=1.0 ,bar_shade=True, tick_font_size='xx-large', \
+                label_font_size='xx-large',smooth=True, \
+                sigmas=np.linspace(0, 3, 4))
+            if savefig:
+                cc.plotter.plot(filename=self.run_id+"_fig6.pdf",
+                    truth=truths, figsize="page")
+            else:
+                fig = cc.plotter.plot(figsize="page", truth=truths)
+                fig.show()
+
+        # ---------------------------------------------------------------------#
+        if 'fig8' in options:
+
+            # here we read in data from the anisotropy models. There's
+            # probably a better way to do this, via concord (if it's
+            # available)
+
+            counts, ybins, xbins, image = plt.hist2d(np.array(xip), 
+                np.array(xib), bins=500, norm=LogNorm(), cmap='OrRd')
+
+            xi_p_model2 = np.arange(0, 2.5, 0.01)
+            xi_b_model2 = np.empty(len(xi_p_model2))
+
+            for i in range(0,250):
+    
+                xi_b_model2[i] = 1./((1./(2*xi_p_model2[i])) + 0.5)
+    
+            # overplot the various models
+
+            plt.plot(xi_p_model2, xi_b_model2, color = 'black',ls='-', label = 'Fujimoto (1988)')  
+
+            if Beans.HAS_CONCORD:
+                # setup dict with list of models, legend labels and linestyles
+                he16_models = {'he16_a': ('He & Keek (2016) model A', '--'),
+                               'he16_b': ('model B', '-.'),
+                               'he16_c': ('model C', (0, (3, 5, 1, 5))), 
+                               'he16_d': ('model D', (0, (1, 5))) }
+
+                for model in he16_models.keys():
+
+                    _model = self.cd.diskmodel.load_he16(model)
+
+                    model_theta = _model['col1']
+                    model_xid = _model['col2']
+                    model_xir = _model['col3']
+                    model_xip1 = _model['col4']
+                    model_xib1 = model_xid + model_xir
+
+                    model_xib = 1./model_xib1
+                    model_xip = 1./model_xip1
+
+                    #modela:
+                    plt.plot(model_xip, model_xib, color='darkblue', 
+                        ls=he16_models[model][1], label=he16_models[model][0])
+
+            else:
+                print ('''
+** WARNING ** install concord if you want to overplot model curves
+              See https://github.com/outs1der/concord''')
+
+            plt.xlabel(r'$\xi_{\mathrm{p}}$',fontsize='xx-large')
+            plt.ylabel(r'$\xi_{\mathrm{b}}$',fontsize='xx-large')
+
+            plt.legend(loc='best',fontsize='large')
+
+            plt.axis([0.,2.1,0.,2.1])
+
+            plt.xticks(fontsize=14)
+            plt.yticks(fontsize=14)
+
+            if savefig:
+                plt.savefig('{}_xipvsxib_models_contourlines.pdf'.format(self.run_id))
+            else:
+                plt.show()
+
+        # ---------------------------------------------------------------------#
+        if 'comparison' in options:
+
+            # make plot of observed burst comparison with predicted bursts:
+
+            plt.figure(figsize=(10,7))
+
+            # plt.scatter(self.bstart, self.fluen, color = 'black', marker = '.', label='Observed', s =200)
+            plt.errorbar(self.bstart, self.fluen, yerr=self.fluene, 
+                color='black', linestyle='', marker='.', ms=13, label='Observed')
+            #plt.scatter(time_pred_35, e_b_pred_35, marker = '*',color='cyan',s = 200, label = '2 M$_{\odot}$, R = 11.2 km')
+            if self.train:
+                # plt.scatter(timepred[1:], ebpred, marker='*', color='darkgrey', s=100, label='Predicted')
+                plt.errorbar(timepred[1:], ebpred, 
+                    yerr=[ebpred_errup, ebpred_errlow],
+                    xerr=[timepred_errup[1:], timepred_errlow[1:]], 
+                    marker='*', ms=11, color='darkgrey', linestyle='', 
+                    label='Predicted')
+            else:
+                plt.scatter(timepred, ebpred, marker='*', color='darkgrey', s=100, label='Predicted')
+                plt.errorbar(timepred, ebpred, yerr=[ebpred_errup, ebpred_errlow],xerr=[timepred_errup, timepred_errlow], fmt='.', color='darkgrey')
+                plt.errorbar(self.bstart,  self.fluen, fmt='.', color='black')
+
+            plt.xlabel("Time (days after start of outburst)")
+            plt.ylabel("Fluence (1e-9 erg/cm$^2$)")
+            plt.legend(loc=2)
+
+            if savefig:
+                print ('Saving burst comparison plot to {}_predictedburstscomparison.pdf'.format(self.run_id))
+                plt.savefig(f'{self.run_id}_predictedburstscomparison.pdf')
+            else:
+                print ('Skipping burst comparison plot save')
+            plt.show()
 
 
